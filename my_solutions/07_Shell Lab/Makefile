@@ -38,7 +38,7 @@ test05:
 test06:
 	$(DRIVER) -t trace06.txt -s $(TSH) -a $(TSHARGS)
 test07:
-	$(DRIVER) -t trace07.txt -s $(TSH) -a $(TSHARGS)
+	$(DRIVER) -t trace07.txt -s $(TSH) -a $(TSHARGS) 
 test08:
 	$(DRIVER) -t trace08.txt -s $(TSH) -a $(TSHARGS)
 test09:

@@ -1,0 +1,16 @@
+{
+    "files.associations": {
+        "getopt.h": "c",
+        "cachelab.h": "c",
+        "iostream": "cpp",
+        "ostream": "cpp",
+        "array": "c",
+        "bitset": "c",
+        "string_view": "c",
+        "initializer_list": "c",
+        "regex": "c",
+        "utility": "c",
+        "valarray": "c",
+        "csapp.h": "c"
+    }
+}

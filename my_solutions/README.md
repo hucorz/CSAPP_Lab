@@ -60,3 +60,28 @@ func4:
 - 这题可能有多个答案（我猜）
 
 ![func4](./img/func4.png)
+
+## 07_Shell Lab
+
+验证方法：
+
+对比以下两个命令的结果：其他的 trace file 同理
+
+```cmd
+make rtest01
+ 
+make test01
+```
+写的时候可以从 01 到 16 不断完善代码
+
+比较需要注意的就是信号的处理，一些内置函数的作用以及参数的意义
+
+test16：一开始写的处理 int 和 stop 信号，一些处理（比如 deletejob，printf信息）都是在对应信号的 handler 中处理的，但是在 test16 中不行，因为 test16 中的 int 和 stop 信号不是从 shell 传递的；子进程收到 int 和 stop 信号后都会向父进程（shell）发送 chld 信号，所以统一在 chld handler 中处理就好
+
+## 08_Shell Lab
+
+只是把书中的 explicit free list 复现了一遍，获得更高的分数需要使用分离适配的方法
+
+结果：
+
+![](./img/Shell%20Lab%20Result.png)

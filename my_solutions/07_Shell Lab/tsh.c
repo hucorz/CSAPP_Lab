@@ -85,6 +85,21 @@ void app_error(char *msg);
 typedef void handler_t(int);
 handler_t *Signal(int signum, handler_t *handler);
 
+/* 错误包装函数 */
+pid_t Fork(void);
+int Sigprocmask(int how, const sigset_t *set, sigset_t *oldset);
+int Sigemptyset(sigset_t *set);
+int Sigfillset(sigset_t *set);
+int Sigaddset(sigset_t *set, int signum);
+int Sigdelset(sigset_t *set, int  signum);
+int Sigismemeber(const sigset_t *set, int signum);
+int Kill(pid_t pid, int sig);
+int Execve(char *path, char** argv, char** environ);
+
+/* 在信号处理程序中使用的安全 IO 函数 */
+size_t sio_strlen(char s[]);
+ssize_t sio_puts(char *s);
+
 /*
  * main - The shell's main routine 
  */
@@ -130,23 +145,22 @@ int main(int argc, char **argv)
 
     /* Execute the shell's read/eval loop */
     while (1) {
-
-	/* Read command line */
-	if (emit_prompt) {
-	    printf("%s", prompt);
-	    fflush(stdout);
-	}
-	if ((fgets(cmdline, MAXLINE, stdin) == NULL) && ferror(stdin))
-	    app_error("fgets error");
-	if (feof(stdin)) { /* End of file (ctrl-d) */
-	    fflush(stdout);
-	    exit(0);
-	}
-
-	/* Evaluate the command line */
-	eval(cmdline);
-	fflush(stdout);
-	fflush(stdout);
+        /* Read command line */
+        if (emit_prompt) {
+            printf("%s", prompt);
+            fflush(stdout);
+        }
+        if ((fgets(cmdline, MAXLINE, stdin) == NULL) && ferror(stdin))
+            app_error("fgets error");
+        if (feof(stdin)) { /* End of file (ctrl-d) */
+            fflush(stdout);
+            exit(0);
+        }
+        // verbose = 1;
+        /* Evaluate the command line */
+        eval(cmdline);
+        fflush(stdout);
+        fflush(stdout);
     } 
 
     exit(0); /* control never reaches here */
@@ -165,6 +179,39 @@ int main(int argc, char **argv)
 */
 void eval(char *cmdline) 
 {
+    char *argv[MAXARGS];
+    int bg;
+    pid_t pid;
+
+    bg = parseline(cmdline, argv);
+    if (argv[0] == NULL) return;    // 空命令
+
+    sigset_t mask_child, mask_prev, mask_all;
+    Sigemptyset(&mask_child);
+    Sigaddset(&mask_child, SIGCHLD);
+    Sigfillset(&mask_all);
+
+    if(!builtin_cmd(argv)) {
+        Sigprocmask(SIG_BLOCK, &mask_child, &mask_prev);   // BLOCK SIGCHILD
+        if ((pid = Fork()) == 0) { // child
+            Sigprocmask(SIG_SETMASK, &mask_prev, NULL);    // UNBLOCK SIGCHILD
+            setpgid(0, 0);
+            Execve(argv[0], argv, environ);
+            exit(0);
+        }
+
+        int state = bg ? BG : FG;
+        Sigprocmask(SIG_BLOCK, &mask_all, NULL);
+        addjob(jobs, pid, state, cmdline);
+        Sigprocmask(SIG_SETMASK, &mask_prev, NULL);        // UNBLOCK SIGCHILD
+
+        if (!bg) {  // foreground job
+            waitfg(fgpid(jobs));
+        } else {   // background job
+            printf("[%d] (%d) %s",pid2jid(pid), pid, cmdline);
+        }
+        
+    }
     return;
 }
 
@@ -231,6 +278,19 @@ int parseline(const char *cmdline, char **argv)
  */
 int builtin_cmd(char **argv) 
 {
+    // printf("in builtin_cmd\n");
+    char *cmd = argv[0];
+    if (!strcmp(cmd, "quit")) {
+        exit(0);
+    } 
+    if (!strcmp(cmd, "jobs")) {
+        listjobs(jobs);
+        return 1;
+    }
+    if (!strcmp(cmd, "bg") || !strcmp(cmd, "fg")) {
+        do_bgfg(argv);
+        return 1;
+    }
     return 0;     /* not a builtin command */
 }
 
@@ -239,6 +299,53 @@ int builtin_cmd(char **argv)
  */
 void do_bgfg(char **argv) 
 {
+    sigset_t mask_all, mask_prev;
+    Sigfillset(&mask_all);
+
+    struct job_t* job;
+    char* id = argv[1];
+
+    if (!id) { // 没有 pid 或者 %jid
+        printf("%s command requires PID or %%jobid argument\n", argv[0]);
+        return;
+    }
+    if (!((id[0] == '%' && atoi(&id[1])) || atoi(&id[0]))) {  // pid 或者 %jid 不正确
+        printf("%s: argument must be a PID or %%jobid\n", argv[0]);
+        return;
+    }
+
+    // get job object
+    if (id[0] == '%'){
+        int jid = atoi(&id[1]);
+        job = getjobjid(jobs, jid);
+    } else {
+        int pid = atoi(id);
+        job = getjobpid(jobs, pid);
+    }
+
+    if (!job) {
+        if (id[0] == '%')
+            printf("%%%s: No such job\n", &id[1]);
+        else
+            printf("(%s): No such process\n", &id[0]);
+        return;
+    }
+
+    if (!strcmp(argv[0], "bg")) {  // background process
+        Sigprocmask(SIG_BLOCK, &mask_all, &mask_prev);
+        job->state = BG;
+        Sigprocmask(SIG_SETMASK, &mask_prev, NULL);
+        
+        Kill(-(job->pid), SIGCONT);
+        printf("[%d] (%d) %s",job->jid, job->pid, job->cmdline);
+    } else if(!strcmp(argv[0], "fg")) {  // foreground process
+        Sigprocmask(SIG_BLOCK, &mask_all, &mask_prev);
+        job->state = FG;
+        Sigprocmask(SIG_SETMASK, &mask_prev, NULL);
+        
+        Kill(-(job->pid), SIGCONT);
+        waitfg(job->pid);
+    }
     return;
 }
 
@@ -247,6 +354,14 @@ void do_bgfg(char **argv)
  */
 void waitfg(pid_t pid)
 {
+    sigset_t mask_empty;
+    Sigemptyset(&mask_empty);
+
+    // 这里用 while 判断是否还有前台程序
+    // 不能用 if，因为 sigsuspend 可能中途因为其他后台程序完成，需要运行信号处理程序而提前返回
+    while (fgpid(jobs) != 0) {
+        sigsuspend(&mask_empty);
+    }
     return;
 }
 
@@ -263,6 +378,40 @@ void waitfg(pid_t pid)
  */
 void sigchld_handler(int sig) 
 {
+    if (verbose) {
+        printf("\nin sigchld_handler\n");
+        listjobs(jobs);
+    }
+    
+    int olderrno = errno, status;
+    pid_t pid;
+    sigset_t mask_all, mask_prev;
+    Sigfillset(&mask_all);
+    // 这里 waitpid 的 options 不能为 0，否则如果有后台进程，sh 会挂起等待后台进程结束
+    // WNOHANG 需要配合其他的行为
+    while ((pid = waitpid(-1, &status, WNOHANG | WUNTRACED)) > 0) { 
+        Sigprocmask(SIG_BLOCK, &mask_all, &mask_prev);
+        if (WIFEXITED(status)) {  // 正常退出的进程
+            deletejob(jobs, pid);
+        } else if (WIFSIGNALED(status)) {
+            // printf 要在 deletejob 后面，有点坑(
+            printf("Job [%d] (%d) terminated by signal %d\n", pid2jid(pid), pid, WTERMSIG(status));
+            deletejob(jobs, pid);
+        } else if(WIFSTOPPED(status)) {
+            printf("Job [%d] (%d) stopped by signal %d\n", pid2jid(pid), pid, WSTOPSIG(status));
+            struct job_t* j = getjobpid(jobs, pid);
+            j->state = ST;
+        }
+        Sigprocmask(SIG_SETMASK, &mask_prev, NULL);
+    }
+    errno = olderrno;
+
+    if (verbose) {
+        printf("out sigchld_handler\n");
+        listjobs(jobs);
+        printf("\n");
+    }
+    
     return;
 }
 
@@ -273,6 +422,26 @@ void sigchld_handler(int sig)
  */
 void sigint_handler(int sig) 
 {
+    if (verbose) {
+        printf("\nsigint_handler\n");
+    }
+    
+    int olderrno = errno;
+    sigset_t mask_all, mask_prev;
+    Sigfillset(&mask_all);
+
+    Sigprocmask(SIG_BLOCK, &mask_all, &mask_prev);
+    pid_t pid = fgpid(jobs);  // jobs 是全局变量
+    Sigprocmask(SIG_SETMASK, &mask_prev, NULL);
+    if (pid > 0) {
+        Kill(-pid, SIGINT);
+        /* shell 收到 int 信号后杀死前台进程，前台进程会向父进程即 shell 发送 sigchld 信号
+        *  下面代码对应的操作应该放到 sigchld_handler 中处理，因为前台进程可能会收到不是来自 shell 的停止信号(test16)，从而 shell 只会收到一个 sigchld 信号
+        *   sigtstp_handler 同理 */
+        // struct job_t* j = getjobpid(jobs, pid);
+        // printf("Job [%d] (%d) terminated by signal 2\n", j->jid, j->pid);
+    }
+    errno = olderrno;
     return;
 }
 
@@ -283,6 +452,29 @@ void sigint_handler(int sig)
  */
 void sigtstp_handler(int sig) 
 {
+    if (verbose) {
+        printf("\nsigtstp_handler\n");
+    }
+
+    int olderrno = errno;
+    sigset_t mask_all, mask_prev;
+    Sigfillset(&mask_all);
+
+    Sigprocmask(SIG_BLOCK, &mask_all, &mask_prev);
+    pid_t pid = fgpid(jobs); // jobs 是全局变量
+    Sigprocmask(SIG_SETMASK, &mask_prev, NULL);
+    if (pid > 0) {
+        /* shell 收到 tstp 信号后暂停前台进程，前台进程会向父进程即 shell 发送 sigchld 信号
+        *  下面一些代码对应的操作应该放到 sigchld_handler 中处理，因为前台进程可能会收到不是来自 shell 的停止信号(test16)，从而 shell 只会收到一个 sigchld 信号
+        *   sigtint_handler 同理 */
+        // Sigprocmask(SIG_BLOCK, &mask_all, &mask_prev);
+        // struct job_t* j = getjobpid(jobs, pid);
+        // j->state = ST;
+        // Sigprocmask(SIG_SETMASK, &mask_prev, NULL);
+        Kill(-pid, SIGTSTP);
+        // printf("Job [%d] (%d) stopped by signal 20\n", j->jid, j->pid);
+    }
+    errno = olderrno;
     return;
 }
 
@@ -328,7 +520,6 @@ int addjob(struct job_t *jobs, pid_t pid, int state, char *cmdline)
     
     if (pid < 1)
 	return 0;
-
     for (i = 0; i < MAXJOBS; i++) {
 	if (jobs[i].pid == 0) {
 	    jobs[i].pid = pid;
@@ -503,6 +694,88 @@ void sigquit_handler(int sig)
 {
     printf("Terminating after receipt of SIGQUIT signal\n");
     exit(1);
+}
+
+/*******************
+ *  错误包装函数
+ *******************/
+pid_t Fork(void) {
+    pid_t pid;
+
+    if ((pid = fork()) < 0)
+        unix_error("Fork error");
+    return pid;
+}
+
+int Sigprocmask(int how, const sigset_t *set, sigset_t *oldset) {
+    int ret;
+    if ((ret = sigprocmask(how, set, oldset)) < 0) 
+        unix_error("Sigprocmask error");
+    return ret;
+}
+int Sigemptyset(sigset_t *set) {
+    int ret;
+    if ((ret = sigemptyset(set)) < 0) 
+        unix_error("Sigprocmask error");
+    return ret;
+}
+
+int Sigfillset(sigset_t *set) {
+    int ret;
+    if ((ret = sigfillset(set)) < 0) 
+        unix_error("Sigprocmask error");
+    return ret;
+}
+
+int Sigaddset(sigset_t *set, int signum) {
+    int ret;
+    if ((ret = sigaddset(set, signum)) < 0) 
+        unix_error("Sigprocmask error");
+    return ret;
+}
+
+int Sigdelset(sigset_t *set, int  signum) {
+    int ret;
+    if ((ret = sigdelset(set, signum)) < 0) 
+        unix_error("Sigprocmask error");
+    return ret;
+}
+
+int Sigismemeber(const sigset_t *set, int signum) {
+    int ret;
+    if ((ret = sigismember(set, signum)) < 0) 
+        unix_error("Sigprocmask error");
+    return ret;
+}
+
+int Kill(pid_t pid, int sig){
+    int ret;
+    if((ret = kill(pid, sig)) < 0){
+        unix_error("Kill error");
+    }
+    return ret;
+}
+
+int Execve(char *path, char** argv, char** environ) {
+    int ret;
+    if ((ret = execve(path, argv, environ)) < 0) {
+        unix_error(path);
+    }
+    return ret;
+}
+
+/************************************
+ *  在信号处理程序中使用的安全 IO 函数 
+ ***********************************/
+size_t sio_strlen(char s[]){
+    size_t i = 0;
+    while (s[i] != '\0')
+        ++i;
+    return i;
+}
+
+ssize_t sio_puts(char *s) {
+    return write(STDOUT_FILENO, s, sio_strlen(s));
 }
 
 
